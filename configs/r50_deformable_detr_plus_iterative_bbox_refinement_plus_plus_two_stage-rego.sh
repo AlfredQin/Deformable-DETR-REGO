@@ -10,4 +10,11 @@ python -u main.py \
     --use_rego \
     --with_box_refine \
     --two_stage \
+    --coco_path '/home/qinc/Dataset/ISAID/iSAID_patches' \
+    --num_workers 12 \
+    --batch_size 2 \
+    --lr 5e-5 \
+    --dataset_file 'isaid' \
+    --pretrained_coco ./ckpt/r50-deformable-detr-plus-plus-rego.pth \
+    --eval \
     ${PY_ARGS}

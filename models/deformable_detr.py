@@ -675,7 +675,7 @@ class MLP(nn.Module):
 
 
 def build(args):
-    num_classes = 20 if args.dataset_file != 'coco' else 91
+    num_classes = 16 if args.dataset_file != 'coco' else 91
     if args.dataset_file == "coco_panoptic":
         num_classes = 250
     device = torch.device(args.device)
@@ -697,6 +697,11 @@ def build(args):
     )
     if args.masks:
         model = DETRsegm(model, freeze_detr=(args.frozen_weights is not None))
+
+    if args.pretrained_coco:
+        pretrained_weights = {k: v for k, v in torch.load(args.pretrained_coco)['model'].items() if not k.startswith("class_embed") and 'class_embed' not in k}
+        model.load_state_dict(pretrained_weights, strict=False)
+
     matcher = build_matcher(args)
     orig_loss_scale = 0.8 if args.use_rego else 1.0
     weight_dict = {'loss_ce': args.cls_loss_coef * orig_loss_scale, 'loss_bbox': args.bbox_loss_coef}

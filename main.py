@@ -53,6 +53,12 @@ def get_args_parser():
     parser.add_argument('--frozen_weights', type=str, default=None,
                         help="Path to the pretrained model. If set, only the mask head will be trained")
 
+    parser.add_argument(
+        '--pretrained_coco',
+        default=None,
+        type=str,
+    )
+
     # * Backbone
     parser.add_argument('--backbone', default='resnet50', type=str,
                         help="Name of the convolutional backbone to use")
