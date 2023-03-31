@@ -70,6 +70,14 @@ def get_args_parser():
                         help="position / size * scale")
     parser.add_argument('--num_feature_levels', default=4, type=int, help='number of feature levels')
 
+    # swin backbone
+    parser.add_argument(
+        "--pretrained_backbone_path",
+        default="./swin_tiny_patch4_window7_224.pkl",
+        type=str,
+    )
+    parser.add_argument("--drop_path_rate", default=0.2, type=float)
+
     # * Transformer
     parser.add_argument('--enc_layers', default=6, type=int,
                         help="Number of encoding layers in the transformer")
