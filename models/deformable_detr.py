@@ -37,7 +37,8 @@ def _get_clones(module, N):
 class DeformableDETR(nn.Module):
     """ This is the Deformable DETR module that performs object detection """
     def __init__(self, backbone, transformer, num_classes, num_queries, num_feature_levels,
-                 aux_loss=True, with_box_refine=False, two_stage=False, glimpse_transformer=None):
+                 aux_loss=True, with_box_refine=False, two_stage=False, glimpse_transformer=None,
+                 mixed_selection=False):
         """ Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -58,6 +59,8 @@ class DeformableDETR(nn.Module):
         self.num_feature_levels = num_feature_levels
         if not two_stage:
             self.query_embed = nn.Embedding(num_queries, hidden_dim*2)
+        elif mixed_selection:
+            self.query_embed = nn.Embedding(num_queries, hidden_dim)
         if num_feature_levels > 1:
             num_backbone_outs = len(backbone.strides)
             input_proj_list = []
@@ -112,6 +115,8 @@ class DeformableDETR(nn.Module):
             self.transformer.decoder.class_embed = self.class_embed
             for box_embed in self.bbox_embed:
                 nn.init.constant_(box_embed.layers[-1].bias.data[2:], 0.0)
+        self.mixed_selection = mixed_selection
+
 
         self.use_rego = not ( (glimpse_transformer is None) )
         if self.use_rego:
@@ -232,8 +237,8 @@ class DeformableDETR(nn.Module):
                 pos.append(pos_l)
 
         query_embeds = None
-        if not self.two_stage:
-            query_embeds = self.query_embed.weight
+        if not self.two_stage or self.mixed_selection:
+            query_embeds = self.query_embed.weight[0: self.num_queries, :]
         hs, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact = self.transformer(srcs, masks, pos, query_embeds)
 
         outputs_classes = []
@@ -693,7 +698,8 @@ def build(args):
         aux_loss=args.aux_loss,
         with_box_refine=args.with_box_refine,
         two_stage=args.two_stage,
-        glimpse_transformer=glimpse_transformer
+        glimpse_transformer=glimpse_transformer,
+        mixed_selection=args.mixed_selection,
     )
     if args.masks:
         model = DETRsegm(model, freeze_detr=(args.frozen_weights is not None))

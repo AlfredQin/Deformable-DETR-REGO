@@ -130,6 +130,10 @@ def get_args_parser():
     parser.add_argument('--num_workers', default=2, type=int)
     parser.add_argument('--cache_mode', default=False, action='store_true', help='whether to cache images on memory')
 
+    # Deformable DETR tricks
+    parser.add_argument("--mixed_selection", action="store_true", default=False)
+    parser.add_argument("--look_forward_twice", action="store_true", default=False)
+
     return parser
 
 

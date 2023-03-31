@@ -16,5 +16,6 @@ python -u main.py \
     --lr 5e-5 \
     --dataset_file 'isaid' \
     --pretrained_coco ./ckpt/r50-deformable-detr-plus-plus-rego.pth \
-    --eval \
+    --mixed_selection \
+    --look_forward_twice \
     ${PY_ARGS}
