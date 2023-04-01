@@ -38,7 +38,7 @@ class DeformableDETR(nn.Module):
     """ This is the Deformable DETR module that performs object detection """
     def __init__(self, backbone, transformer, num_classes, num_queries, num_feature_levels,
                  aux_loss=True, with_box_refine=False, two_stage=False, glimpse_transformer=None,
-                 mixed_selection=False):
+                 mixed_selection=False, num_queries_one2one=300, num_queries_one2many=0,):
         """ Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -51,6 +51,8 @@ class DeformableDETR(nn.Module):
             two_stage: two-stage Deformable DETR
         """
         super().__init__()
+        num_queries = num_queries_one2one + num_queries_one2many
+
         self.num_queries = num_queries
         self.transformer = transformer
         hidden_dim = transformer.d_model
@@ -116,18 +118,18 @@ class DeformableDETR(nn.Module):
             for box_embed in self.bbox_embed:
                 nn.init.constant_(box_embed.layers[-1].bias.data[2:], 0.0)
         self.mixed_selection = mixed_selection
-
+        self.num_queries_one2one = num_queries_one2one
 
         self.use_rego = not ( (glimpse_transformer is None) )
         if self.use_rego:
-            self.rego_scales = [3.0, 2.0, 1.0] 
+            self.rego_scales = [3.0, 2.0, 1.0]
 
             self.dropout = nn.Dropout(p=0.01)
             self.roi_query_dim = 256
             self.feat_gp = 4
             self.roi_feat_dim = self.roi_query_dim #* self.feat_gp
 
-            self.ctx_ch = 64 
+            self.ctx_ch = 64
             ctx_inconvs = []
             ctx_outconvs = []
             ctx_gns = []
@@ -149,11 +151,11 @@ class DeformableDETR(nn.Module):
                     nn.init.normal_(mm.weight, mean=0., std=1e-3)
                     nn.init.constant_(mm.bias, 0.0)
 
-            self.roi_ext = torchvision.ops.MultiScaleRoIAlign(['feat1', 'feat2', 'feat3', 'feat4'], 7, 2) 
-            num_pred = glimpse_transformer.decoder.num_layers 
+            self.roi_ext = torchvision.ops.MultiScaleRoIAlign(['feat1', 'feat2', 'feat3', 'feat4'], 7, 2)
+            num_pred = glimpse_transformer.decoder.num_layers
             for gi in range(len(self.rego_scales)):
                 rcnn_net = nn.Sequential( *[nn.Conv2d(hidden_dim, self.roi_feat_dim, kernel_size=7, stride=1, padding=0, groups=self.feat_gp),   #
-                                            nn.Flatten(1), nn.LayerNorm(self.roi_feat_dim), nn.ReLU(),  
+                                            nn.Flatten(1), nn.LayerNorm(self.roi_feat_dim), nn.ReLU(),
                                             nn.Linear(self.roi_feat_dim, self.roi_query_dim), nn.LayerNorm(self.roi_query_dim) ])
                 setattr(self, 'rcnn_net_%d'%gi, rcnn_net)
                 if gi == 0:
@@ -170,7 +172,7 @@ class DeformableDETR(nn.Module):
                 setattr(self, 'rego_hs_fuser_%d'%gi, _get_clones(rego_hs_fuser, num_pred))
                 setattr(self, 'layer_norms_%d'%gi, nn.ModuleList([nn.LayerNorm(hidden_dim) for i in range(num_pred)]))
 
-                rego_class_embed = nn.Linear(hidden_dim, num_classes) 
+                rego_class_embed = nn.Linear(hidden_dim, num_classes)
                 rego_bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
                 rego_class_embed.bias.data = torch.ones(num_classes) * bias_value
                 nn.init.constant_(rego_bbox_embed.layers[-1].weight.data, 0)
@@ -178,7 +180,7 @@ class DeformableDETR(nn.Module):
                 setattr(self, 'rego_class_embed_%d'%gi, nn.ModuleList([rego_class_embed for _ in range(num_pred)]))
                 setattr(self, 'rego_bbox_embed_%d'%gi, nn.ModuleList([rego_bbox_embed for _ in range(num_pred)]))
 
-                for m_str in ['rcnn_net', 'layer_norms']: 
+                for m_str in ['rcnn_net', 'layer_norms']:
                     m = getattr(self, m_str + '_%d'%gi)
                     for mm in m.modules():
                         if isinstance(mm, nn.Conv2d):
@@ -239,10 +241,24 @@ class DeformableDETR(nn.Module):
         query_embeds = None
         if not self.two_stage or self.mixed_selection:
             query_embeds = self.query_embed.weight[0: self.num_queries, :]
-        hs, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact = self.transformer(srcs, masks, pos, query_embeds)
+
+        # make attn mask
+        """ attention mask to prevent information leakage
+        """
+        self_attn_mask = (
+            torch.zeros([self.num_queries, self.num_queries, ]).bool().to(src.device)
+        )
+        self_attn_mask[self.num_queries_one2one:, 0: self.num_queries_one2one, ] = True
+        self_attn_mask[0: self.num_queries_one2one, self.num_queries_one2one:, ] = True
+
+        hs, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact = self.transformer(srcs, masks, pos, query_embeds, self_attn_mask)
 
         outputs_classes = []
         outputs_coords = []
+        outputs_classes_one2one = []
+        outputs_coords_one2one = []
+        outputs_classes_one2many = []
+        outputs_coords_one2many = []
         for lvl in range(hs.shape[0]):
             if lvl == 0:
                 reference = init_reference
@@ -257,18 +273,56 @@ class DeformableDETR(nn.Module):
                 assert reference.shape[-1] == 2
                 tmp[..., :2] += reference
             outputs_coord = tmp.sigmoid()
-            outputs_classes.append(outputs_class)
-            outputs_coords.append(outputs_coord)
-        outputs_class = torch.stack(outputs_classes)
-        outputs_coord = torch.stack(outputs_coords)
 
-        out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
+            outputs_classes_one2one.append(
+                outputs_class[:, 0: self.num_queries_one2one]
+            )
+            outputs_classes_one2many.append(
+                outputs_class[:, self.num_queries_one2one:]
+            )
+            outputs_coords_one2one.append(
+                outputs_coord[:, 0: self.num_queries_one2one]
+            )
+            outputs_coords_one2many.append(outputs_coord[:, self.num_queries_one2one:])
+
+        #     outputs_classes.append(outputs_class)
+        #     outputs_coords.append(outputs_coord)
+        # outputs_class = torch.stack(outputs_classes)
+        # outputs_coord = torch.stack(outputs_coords)
+
+        outputs_classes_one2one = torch.stack(outputs_classes_one2one)
+        outputs_coords_one2one = torch.stack(outputs_coords_one2one)
+        outputs_classes_one2many = torch.stack(outputs_classes_one2many)
+        outputs_coords_one2many = torch.stack(outputs_coords_one2many)
+        outputs_coord = outputs_coords_one2one
+        hs = hs[:, :, 0: self.num_queries_one2one, :]
+        out = {
+            "pred_logits": outputs_classes_one2one[-1],
+            "pred_boxes": outputs_coords_one2one[-1],
+            "pred_logits_one2many": outputs_classes_one2many[-1],
+            "pred_boxes_one2many": outputs_coords_one2many[-1],
+        }
         if self.aux_loss:
-            out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)
+            out["aux_outputs"] = self._set_aux_loss(
+                outputs_classes_one2one, outputs_coords_one2one
+            )
+            out["aux_outputs_one2many"] = self._set_aux_loss(
+                outputs_classes_one2many, outputs_coords_one2many
+            )
 
         if self.two_stage:
             enc_outputs_coord = enc_outputs_coord_unact.sigmoid()
-            out['enc_outputs'] = {'pred_logits': enc_outputs_class, 'pred_boxes': enc_outputs_coord}
+            out["enc_outputs"] = {
+                "pred_logits": enc_outputs_class,
+                "pred_boxes": enc_outputs_coord,
+            }
+        # out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
+        # if self.aux_loss:
+        #     out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)
+        #
+        # if self.two_stage:
+        #     enc_outputs_coord = enc_outputs_coord_unact.sigmoid()
+        #     out['enc_outputs'] = {'pred_logits': enc_outputs_class, 'pred_boxes': enc_outputs_coord}
 
         if self.use_rego:
             im_shapes = samples.im_shapes
@@ -278,17 +332,17 @@ class DeformableDETR(nn.Module):
             feat_dict = {}
             for i in range(len(srcs)):
                 feat_dict['feat%d'%i] = srcs[i]
-    
+
             # context features
             lvl_feats = {}
             for i in range(len(srcs)):
                 feat = feat_dict['feat%d'%i]
                 for gi in range(3):
                     in_feat = feat.detach()
-                    local_ctx_feat = self.ctx_inconvs[i*3+gi](F.relu(in_feat)) # N C' H W 
-                    local_ctx_feat = F.relu(local_ctx_feat) 
+                    local_ctx_feat = self.ctx_inconvs[i*3+gi](F.relu(in_feat)) # N C' H W
+                    local_ctx_feat = F.relu(local_ctx_feat)
                     ctx_feat = self.ctx_outconvs[i*3+gi](local_ctx_feat) # N C H W
-                    feat = feat + 0.1 * self.dropout(ctx_feat ) 
+                    feat = feat + 0.1 * self.dropout(ctx_feat )
                 feat = self.ctx_gns[i](feat)
                 lvl_feats.update({'feat%d'%(i+1): feat})
 
@@ -305,22 +359,22 @@ class DeformableDETR(nn.Module):
             for gi in range(len(self.rego_scales)):
                 with torch.no_grad():
                     scalar_tensor = torch.ones( (batch_num, 1, 4), device=srcs[-1].device)
-                    scalar_tensor[:,:,2:] = self.rego_scales[gi] 
+                    scalar_tensor[:,:,2:] = self.rego_scales[gi]
 
                 pred_bboxes = (prev_coord * scalar_tensor).clamp(max=1.0)
                 pred_bboxes = pred_bboxes * im_shape_tensor
                 pred_bboxes = box_ops.box_cxcywh_to_xyxy(pred_bboxes) # N x NP x 4
                 pred_bboxes = [pred_bboxes[i] for i in range(batch_num)]
 
-                ext_roi_feat = self.roi_ext(lvl_feats, pred_bboxes, [(imh, imw)])# (Nx3NP) x C x L x L 
-                ext_roi_feat = getattr(self, 'rcnn_net_%d'%gi)(ext_roi_feat) 
-                rego_in = ext_roi_feat.view(batch_num, -1, self.roi_query_dim) 
+                ext_roi_feat = self.roi_ext(lvl_feats, pred_bboxes, [(imh, imw)])# (Nx3NP) x C x L x L
+                ext_roi_feat = getattr(self, 'rcnn_net_%d'%gi)(ext_roi_feat)
+                rego_in = ext_roi_feat.view(batch_num, -1, self.roi_query_dim)
 
                 prev_hs = getattr(self, 'rego_hs_linear_%d'%gi)(prev_dec_hs)
                 prev_hs = getattr(self, 'rego_hs_linear_norm_%d'%gi)(prev_hs)
 
-                rego_hs = getattr(self, 'glimpse_transformer_%d'%gi)(rego_in, prev_hs)[0] # NL(6) x N x Q x d 
-                #rego_hs = getattr(self, 'glimpse_transformer_%d'%gi)(prev_hs, rego_in)[0] # NL(6) x N x Q x d 
+                rego_hs = getattr(self, 'glimpse_transformer_%d'%gi)(rego_in, prev_hs)[0] # NL(6) x N x Q x d
+                #rego_hs = getattr(self, 'glimpse_transformer_%d'%gi)(prev_hs, rego_in)[0] # NL(6) x N x Q x d
 
                 rego_output_classes = []
                 rego_output_coords = []
@@ -329,14 +383,14 @@ class DeformableDETR(nn.Module):
                 l_norms = getattr(self, 'layer_norms_%d'%gi)
                 class_embeds = getattr(self, 'rego_class_embed_%d'%gi)
                 bbox_embeds = getattr(self, 'rego_bbox_embed_%d'%gi)
-                prev_h = prev_dec_hs.detach() 
+                prev_h = prev_dec_hs.detach()
                 for lvl in range(rego_hs.shape[0]):
-                    fuse_h = torch.cat((prev_h, rego_hs[lvl]), 2) 
-                    fuse_h = hs_fusers[lvl](fuse_h) 
+                    fuse_h = torch.cat((prev_h, rego_hs[lvl]), 2)
+                    fuse_h = hs_fusers[lvl](fuse_h)
                     fuse_h = l_norms[lvl](fuse_h)
 
                     output_class = class_embeds[lvl](fuse_h)
-                    reference_reg = reference_reg + bbox_embeds[lvl](fuse_h) 
+                    reference_reg = reference_reg + bbox_embeds[lvl](fuse_h)
                     output_coord = reference_reg.sigmoid()
 
                     rego_output_classes.append(output_class)
@@ -345,7 +399,7 @@ class DeformableDETR(nn.Module):
                 rego_output_classes = torch.stack(rego_output_classes)
                 rego_output_coords = torch.stack(rego_output_coords)
 
-                rego_outs = {'pred_logits_rego_%d'%gi: rego_output_classes[-1], 'pred_boxes_rego_%d'%gi: rego_output_coords[-1]} 
+                rego_outs = {'pred_logits_rego_%d'%gi: rego_output_classes[-1], 'pred_boxes_rego_%d'%gi: rego_output_coords[-1]}
                 out.update(rego_outs)
                 if self.aux_loss:
                     box_aux = self._set_rego_aux_loss(rego_output_classes, rego_output_coords, prefix='_rego_%d'%gi)
@@ -391,7 +445,7 @@ class SetCriterion(nn.Module):
         self.losses = losses
         self.focal_alpha = focal_alpha
         self.use_rego = use_rego
-        self.num_rego = 3 
+        self.num_rego = 3
 
     def loss_labels(self, outputs, targets, indices, num_boxes, log=True, extra_indices=None):
         """Classification loss (NLL)
@@ -565,7 +619,7 @@ class SetCriterion(nn.Module):
             extra_indices = {}
             for gi in range(self.num_rego):
                 extra_outs = {'pred_logits': outputs['pred_logits_rego_%d'%gi], 'pred_boxes':outputs['pred_boxes_rego_%d'%gi]}
-                indices = self.matcher(extra_outs, targets) 
+                indices = self.matcher(extra_outs, targets)
                 extra_indices.update({'rego_%d_ind'%gi: indices})
         else:
             extra_indices = None
@@ -591,7 +645,7 @@ class SetCriterion(nn.Module):
                     ext_name = ''
 
                 if ext_flag:
-                    aux_outputs = {'pred_logits': aux_outputs['pred_logits' + ext_name], 
+                    aux_outputs = {'pred_logits': aux_outputs['pred_logits' + ext_name],
                                 'pred_boxes': aux_outputs['pred_boxes' + ext_name]}
                 indices = self.matcher(aux_outputs, targets)
                 for loss in self.losses:
@@ -700,6 +754,8 @@ def build(args):
         two_stage=args.two_stage,
         glimpse_transformer=glimpse_transformer,
         mixed_selection=args.mixed_selection,
+        num_queries_one2one=args.num_queries_one2one,
+        num_queries_one2many=args.num_queries_one2many,
     )
     if args.masks:
         model = DETRsegm(model, freeze_detr=(args.frozen_weights is not None))
@@ -723,13 +779,19 @@ def build(args):
         aux_weight_dict.update({k + f'_enc': v for k, v in weight_dict.items()})
         weight_dict.update(aux_weight_dict)
 
+    new_dict = dict()
+    for key, value in weight_dict.items():
+        new_dict[key] = value
+        new_dict[key + "_one2many"] = value
+    weight_dict = new_dict
+
     losses = ['labels', 'boxes'] #, 'cardinality']
     if args.masks:
         losses += ["masks"]
 
     if args.use_rego:
-        for gi in range(3): 
-            rego_weight_dict = {'loss_ce_rego_%d'%gi: args.cls_loss_coef, 'loss_bbox_rego_%d'%gi: args.bbox_loss_coef,  
+        for gi in range(3):
+            rego_weight_dict = {'loss_ce_rego_%d'%gi: args.cls_loss_coef, 'loss_bbox_rego_%d'%gi: args.bbox_loss_coef,
                                 'loss_giou_rego_%d'%gi: args.giou_loss_coef}
             weight_dict.update(rego_weight_dict)
 

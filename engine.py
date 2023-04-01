@@ -14,6 +14,7 @@ import math
 import os
 import sys
 from typing import Iterable
+import copy
 
 import torch
 import util.misc as utils
@@ -24,7 +25,7 @@ from datasets.data_prefetcher import data_prefetcher
 
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
-                    device: torch.device, epoch: int, max_norm: float = 0):
+                    device: torch.device, epoch: int, max_norm: float = 0, k_one2many=1, lambda_one2many=1.0,):
     model.train()
     criterion.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -40,7 +41,14 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     # for samples, targets in metric_logger.log_every(data_loader, print_freq, header):
     for _ in metric_logger.log_every(range(len(data_loader)), print_freq, header):
         outputs = model(samples)
-        loss_dict = criterion(outputs, targets)
+
+        if k_one2many > 0:
+            loss_dict = compute_hybrid_loss(
+                outputs, targets, k_one2many, criterion, lambda_one2many
+            )
+        else:
+            loss_dict = criterion(outputs, targets)
+
         weight_dict = criterion.weight_dict
         losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
 
@@ -96,6 +104,14 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
 @torch.no_grad()
 def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, output_dir, extra_rst=None):
+
+    # disable the one-to-many branch queries
+    # save them frist
+    save_num_queries = model.module.num_queries
+    save_two_stage_num_proposals = model.module.transformer.two_stage_num_proposals
+    model.module.num_queries = model.module.num_queries_one2one
+    model.module.transformer.two_stage_num_proposals = model.module.num_queries
+
     model.eval()
     criterion.eval()
 
@@ -183,4 +199,35 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
         stats['PQ_th'] = panoptic_res["Things"]
         stats['PQ_st'] = panoptic_res["Stuff"]
 
+    # recover the model parameters for next training epoch
+    model.module.num_queries = save_num_queries
+    model.module.transformer.two_stage_num_proposals = save_two_stage_num_proposals
+
     return stats, coco_evaluator
+
+
+def compute_hybrid_loss(outputs, targets, k_one2many, criterion, lambda_one2many):
+    # one-to-one-loss
+    loss_dict = criterion(outputs, targets)
+    multi_targets = copy.deepcopy(targets)
+    # repeat the targets
+    for target in multi_targets:
+        target["boxes"] = target["boxes"].repeat(k_one2many, 1)
+        target["labels"] = target["labels"].repeat(k_one2many)
+
+    outputs_one2many = dict()
+    outputs_one2many["pred_logits"] = outputs["pred_logits_one2many"]
+    outputs_one2many["pred_boxes"] = outputs["pred_boxes_one2many"]
+    outputs_one2many["aux_outputs"] = outputs["aux_outputs_one2many"]
+
+    # one-to-many loss
+    criterion.use_rego = False
+    loss_dict_one2many = criterion(outputs_one2many, multi_targets)
+    for key, value in loss_dict_one2many.items():
+        if key + "_one2many" in loss_dict.keys():
+            loss_dict[key + "_one2many"] += value * lambda_one2many
+        else:
+            loss_dict[key + "_one2many"] = value * lambda_one2many
+    criterion.use_rego = True
+
+    return loss_dict

@@ -93,6 +93,18 @@ def get_args_parser():
                         help="Number of attention heads inside the transformer's attentions")
     parser.add_argument('--num_queries', default=300, type=int,
                         help="Number of query slots")
+    parser.add_argument(
+        "--num_queries_one2one",
+        default=300,
+        type=int,
+        help="Number of query slots for one-to-one matching",
+    )
+    parser.add_argument(
+        "--num_queries_one2many",
+        default=0,
+        type=int,
+        help="Number of query slots for one-to-many matchining",
+    )
     parser.add_argument('--dec_n_points', default=4, type=int)
     parser.add_argument('--enc_n_points', default=4, type=int)
 
@@ -141,6 +153,9 @@ def get_args_parser():
     # Deformable DETR tricks
     parser.add_argument("--mixed_selection", action="store_true", default=False)
     parser.add_argument("--look_forward_twice", action="store_true", default=False)
+    # hybrid branch
+    parser.add_argument("--k_one2many", default=5, type=int)
+    parser.add_argument("--lambda_one2many", default=1.0, type=float)
 
     return parser
 
@@ -300,7 +315,9 @@ def main(args):
         if args.distributed:
             sampler_train.set_epoch(epoch)
         train_stats = train_one_epoch(
-            model, criterion, data_loader_train, optimizer, device, epoch, args.clip_max_norm)
+            model, criterion, data_loader_train, optimizer, device, epoch, args.clip_max_norm,
+            k_one2many=args.k_one2many,
+            lambda_one2many=args.lambda_one2many,)
         lr_scheduler.step()
         if args.output_dir:
             checkpoint_paths = [output_dir / 'checkpoint.pth']
