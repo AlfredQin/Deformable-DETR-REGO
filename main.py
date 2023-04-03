@@ -137,6 +137,7 @@ def get_args_parser():
     parser.add_argument('--eval', action='store_true')
     parser.add_argument('--num_workers', default=2, type=int)
     parser.add_argument('--cache_mode', default=False, action='store_true', help='whether to cache images on memory')
+    parser.add_argument('--strong_aug', default=False, action='store_true', help='whether to use strong augmentation')
 
     # Deformable DETR tricks
     parser.add_argument("--mixed_selection", action="store_true", default=False)

@@ -142,7 +142,7 @@ class ConvertCocoPolysToMask(object):
         return image, target
 
 
-def make_coco_transforms(image_set):
+def make_coco_transforms(image_set, strong_aug=False):
 
     normalize = T.Compose(
         [T.ToTensor(), T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])]
@@ -151,22 +151,47 @@ def make_coco_transforms(image_set):
     scales = [480, 512, 544, 576, 608, 640, 672, 704, 736, 768, 800]
 
     if image_set == "train":
-        return T.Compose(
-            [
-                T.RandomHorizontalFlip(),
-                T.RandomSelect(
-                    T.RandomResize(scales, max_size=1333),
-                    T.Compose(
-                        [
-                            T.RandomResize([400, 500, 600]),
-                            T.RandomSizeCrop(384, 600),
-                            T.RandomResize(scales, max_size=1333),
-                        ]
+        if strong_aug:
+            import datasets.sltransform as SLT
+            return T.Compose(
+                [
+                    T.RandomHorizontalFlip(),
+                    T.RandomSelect(
+                        T.RandomResize(scales, max_size=1333),
+                        T.Compose(
+                            [
+                                T.RandomResize([400, 500, 600]),
+                                T.RandomSizeCrop(384, 600),
+                                T.RandomResize(scales, max_size=1333),
+                            ]
+                        ),
                     ),
-                ),
-                normalize,
-            ]
-        )
+                    SLT.RandomSelectMulti([
+                        SLT.RandomCrop(),
+                        SLT.LightingNoise(),
+                        SLT.AdjustBrightness(2),
+                        SLT.AdjustContrast(2),
+                    ]),
+                    normalize,
+                ]
+            )
+        else:
+            return T.Compose(
+                [
+                    T.RandomHorizontalFlip(),
+                    T.RandomSelect(
+                        T.RandomResize(scales, max_size=1333),
+                        T.Compose(
+                            [
+                                T.RandomResize([400, 500, 600]),
+                                T.RandomSizeCrop(384, 600),
+                                T.RandomResize(scales, max_size=1333),
+                            ]
+                        ),
+                    ),
+                    normalize,
+                ]
+            )
 
     if image_set == "val":
         return T.Compose([T.RandomResize([800], max_size=1333), normalize,])
@@ -190,7 +215,7 @@ def build(image_set, args, eval_in_training_set):
     dataset = CocoDetection(
         img_folder,
         ann_file,
-        transforms=make_coco_transforms(image_set),
+        transforms=make_coco_transforms(image_set, strong_aug=args.strong_aug),
         return_masks=args.masks,
         cache_mode=args.cache_mode,
         local_rank=get_local_rank(),
