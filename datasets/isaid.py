@@ -193,7 +193,7 @@ def make_coco_transforms(image_set, strong_aug=False):
                 ]
             )
 
-    if image_set == "val":
+    if image_set == "val" or image_set == 'test':
         return T.Compose([T.RandomResize([800], max_size=1333), normalize,])
 
     raise ValueError(f"unknown {image_set}")
@@ -206,6 +206,9 @@ def build(image_set, args, eval_in_training_set):
     PATHS = {
         "train": (root / "train/images", root/'train'/ f"instancesonly_filtered_train.json"),
         "val": (root / "val/images", root / "val" / f"instancesonly_filtered_val.json"),
+        "test": (root / "test" / "images",
+                 root / "test" / f'test_info.json'
+                 ),
     }
 
     img_folder, ann_file = PATHS[image_set]

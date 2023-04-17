@@ -13,6 +13,7 @@ Train and eval functions used in main.py
 import math
 import os
 import sys
+import json
 from typing import Iterable
 
 import torch
@@ -114,7 +115,11 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
             data_loader.dataset.ann_folder,
             output_dir=os.path.join(output_dir, "panoptic_eval"),
         )
-
+    result_file = os.path.join(output_dir, 'result_val.json')
+    if os.path.exists(result_file):
+        os.remove(result_file)
+    cnt = 0
+    json_list = []
     for samples, targets in metric_logger.log_every(data_loader, 100, header):
         samples = samples.to(device)
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
@@ -144,6 +149,19 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
             target_sizes = torch.stack([t["size"] for t in targets], dim=0)
             results = postprocessors['segm'](results, outputs, orig_target_sizes, target_sizes)
         res = {target['image_id'].item(): output for target, output in zip(targets, results)}
+        cnt += 1
+
+        for image_id, result in res.items():
+            for i in range(100):
+                if result['scores'][i] >= 0.5:
+                    json_string = {
+                        "image_id": image_id,
+                        "category_id": result['labels'][i].detach().cpu().numpy().tolist(),
+                        "bbox": result['boxes'][i].detach().cpu().numpy().tolist(),
+                        "score": result['scores'][i].detach().cpu().numpy().tolist(),
+                    }
+                    json_list.append(json_string)
+
         if coco_evaluator is not None:
             coco_evaluator.update(res)
 
@@ -157,6 +175,8 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
 
             panoptic_evaluator.update(res_pano)
 
+    with open(result_file, 'a') as file:
+        json.dump(json_list, file)
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
